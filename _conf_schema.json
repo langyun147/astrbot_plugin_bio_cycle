@@ -1,0 +1,38 @@
+{
+  "enable": {
+    "description": "启用生理周期拟真",
+    "type": "bool",
+    "default": true,
+    "hint": "总开关。关闭后不再注入任何生理周期状态"
+  },
+  "character_name": {
+    "description": "角色名称",
+    "type": "string",
+    "default": "晚宁",
+    "hint": "用于状态展示与提示词措辞，建议与 time_prompt 的角色名保持一致"
+  },
+  "intensity": {
+    "description": "拟真强度",
+    "type": "string",
+    "default": "subtle",
+    "options": ["subtle", "moderate"],
+    "hint": "subtle=细腻自然（只在语气精力上体现）；moderate=明显戏剧化（情绪起伏更外露）"
+  },
+  "intimacy_favour_threshold": {
+    "description": "私密状态流露的好感度阈值",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    },
+    "default": 60,
+    "hint": "联动 favorpro：好感度达到该值且关系够近时，才会自然向对方流露经期不适、撒娇被照顾等私密状态"
+  },
+  "intimacy_relationship_keywords": {
+    "description": "亲密关系关键词",
+    "type": "list",
+    "default": ["男友", "男朋友", "老公", "恋人", "对象", "情侣", "爱人", "亲密"],
+    "hint": "favorpro 关系字段中包含其中任一关键词，才视为亲密关系（与好感度阈值同时满足才流露私密状态）"
+  }
+}

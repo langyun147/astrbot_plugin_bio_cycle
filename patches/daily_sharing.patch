@@ -1,0 +1,143 @@
+diff --git a/_conf_schema.json b/_conf_schema.json
+index 242ef01..63582d1 100644
+--- a/_conf_schema.json
++++ b/_conf_schema.json
+@@ -285,6 +285,12 @@
+         "default": true,
+         "hint": "需要安装 astrbot_plugin_life_scheduler 插件，开启后，分享内容会结合虚拟生活状态（如当前活动、地点、天气等），使分享更自然真实"
+       },
++      "inject_persona_state": {
++        "description": "主动分享注入生理周期/好感状态",
++        "type": "bool",
++        "default": true,
++        "hint": "需要安装 astrbot_plugin_bio_cycle / favorpro 插件。开启后，主动分享会结合当前生理周期身体状态、以及对私聊对象的好感关系，使主动消息更贴合“此刻的她”。关闭则回到仅时间+日程。"
++      },
+       "life_context_in_group": {
+         "description": "启用群聊拟人化人设",
+         "type": "bool",
+diff --git a/core/content.py b/core/content.py
+index 05f4fe8..9f4671e 100644
+--- a/core/content.py
++++ b/core/content.py
+@@ -114,6 +114,101 @@ class ContentService:
+             return ""
+         return str(text or "").strip()
+ 
++    # ---------- 生理周期 / 好感关系状态锚（主动分享专用） ----------
++
++    def _find_plugin_instance(self, keyword: str):
++        """按关键字发现插件实例，参照本仓库既定的跨插件发现模式。"""
++        try:
++            for plugin in self.context.get_all_stars():
++                p_id = str(getattr(plugin, "id", "") or "")
++                p_name = str(getattr(plugin, "name", "") or "")
++                if keyword in p_id or keyword in p_name:
++                    return (
++                        getattr(plugin, "instance", None)
++                        or getattr(plugin, "star_instance", None)
++                        or getattr(plugin, "star_cls", None)
++                    )
++        except Exception as e:
++            logger.debug(f"[内容服务] 查找插件 '{keyword}' 失败: {e}")
++        return None
++
++    @staticmethod
++    def _parse_active_identity(target_id: str) -> Tuple[bool, str]:
++        """从 UMO 解析 (是否群聊, 对方 user_id)。
++
++        私聊（FriendMessage/PrivateMessage）返回真实 user_id；群聊/广播返回 ("", is_group=True)。
++        """
++        text = str(target_id or "")
++        if not text or text == "qzone_broadcast":
++            return True, ""
++        lowered = text.lower()
++        is_group = any(k in lowered for k in ("group", "guild", "channel", "room"))
++        if is_group:
++            return True, ""
++        # 三段式 UMO: platform:msg_type:real_id
++        parts = text.split(":", 2)
++        real_id = parts[2].strip() if len(parts) == 3 else text.strip()
++        return False, real_id
++
++    def _build_favour_anchor(self, target_id: str) -> str:
++        """私聊场景下取 favorpro 只读好感关系锚；群聊/广播返回空串。"""
++        is_group, user_id = self._parse_active_identity(target_id)
++        if is_group or not user_id:
++            return ""
++        plugin = self._find_plugin_instance("favorpro")
++        if not plugin or not hasattr(plugin, "build_external_favour_anchor"):
++            return ""
++        try:
++            return str(plugin.build_external_favour_anchor(user_id) or "").strip()
++        except Exception as e:
++            logger.debug(f"[内容服务] 调用 favorpro 好感锚失败: {e}")
++            return ""
++
++    def _build_cycle_anchor(self, target_id: str) -> str:
++        """取 bio_cycle 身体状态锚；私聊够亲密时附带私密表达许可。"""
++        if target_id == "qzone_broadcast":
++            return ""
++        plugin = self._find_plugin_instance("bio_cycle")
++        if not plugin or not hasattr(plugin, "build_external_cycle_anchor"):
++            return ""
++        favour = relationship = None
++        is_group, user_id = self._parse_active_identity(target_id)
++        if not is_group and user_id:
++            fav = self._find_plugin_instance("favorpro")
++            if fav is not None:
++                try:
++                    state = fav.manager.get_user_state(
++                        fav.manager.normalize_identifier(user_id), None,
++                        fav._identity_fallback_keys(user_id),
++                    )
++                    favour = state.get("favour")
++                    relationship = state.get("relationship")
++                except Exception as e:
++                    logger.debug(f"[内容服务] 读取 favorpro 状态用于亲密度门控失败: {e}")
++        try:
++            return str(
++                plugin.build_external_cycle_anchor(
++                    target_id, purpose="active_share",
++                    favour=favour, relationship=relationship,
++                ) or ""
++            ).strip()
++        except Exception as e:
++            logger.debug(f"[内容服务] 调用 bio_cycle 周期锚失败: {e}")
++            return ""
++
++    def _build_active_state_anchors(self, target_id: str) -> str:
++        """聚合主动分享要追加的状态锚：周期 + 好感（时间/日程在别处已注入）。
++
++        受 context_conf.inject_persona_state 开关控制，默认开启。
++        """
++        if not self.context_conf.get("inject_persona_state", True):
++            return ""
++        segments = [
++            self._build_cycle_anchor(target_id),
++            self._build_favour_anchor(target_id),
++        ]
++        return "\n\n".join(s for s in segments if s)
++
+     def _parse_str_list_to_dict(self, data_list: List[str]) -> Dict[str, List[str]]:
+         """
+         将配置中的 List[str] 转换为 Dict[str, List[str]]
+@@ -165,12 +260,16 @@ class ContentService:
+         # 同样作用于主动分享：daily_sharing 通过 llm_generate 直连 provider，
+         # 不会触发 on_llm_request，需要手动取一次并叠加到 system_prompt 末尾。
+         persona_prompt = persona_info.get("prompt", "")
++        # 时间物理锁 + 生理周期身体状态 + 好感关系，统一叠加到人设末尾。
++        # 日程/穿搭已通过 life_hint 进入 prompt，此处不重复注入。
+         time_anchor = self._build_time_anchor(target_id)
+-        if time_anchor:
++        state_anchors = self._build_active_state_anchors(target_id)
++        anchor_block = "\n\n".join(s for s in (time_anchor, state_anchors) if s)
++        if anchor_block:
+             if persona_prompt:
+-                effective_persona = f"{persona_prompt.rstrip()}\n\n{time_anchor}"
++                effective_persona = f"{persona_prompt.rstrip()}\n\n{anchor_block}"
+             else:
+-                effective_persona = time_anchor
++                effective_persona = anchor_block
+         else:
+             effective_persona = persona_prompt
+ 

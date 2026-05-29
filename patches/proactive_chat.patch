@@ -1,0 +1,128 @@
+diff --git a/core/llm_adapter.py b/core/llm_adapter.py
+index 0b45d16..7df4b7e 100644
+--- a/core/llm_adapter.py
++++ b/core/llm_adapter.py
+@@ -536,6 +536,106 @@ class LlmMixin:
+         )
+         return effective_history
+ 
++    # ---------- 角色状态锚（主动消息复用其他插件的对外 anchor） ----------
++
++    def _find_state_plugin(self, keyword: str):
++        """按关键字发现插件实例，参照本仓库既定的跨插件发现模式。"""
++        try:
++            for plugin in self.context.get_all_stars():
++                p_id = str(getattr(plugin, "id", "") or "")
++                p_name = str(getattr(plugin, "name", "") or "")
++                if keyword in p_id or keyword in p_name:
++                    return (
++                        getattr(plugin, "instance", None)
++                        or getattr(plugin, "star_instance", None)
++                        or getattr(plugin, "star_cls", None)
++                    )
++        except Exception as e:
++            logger.debug(f"[主动消息] 查找插件 '{keyword}' 失败喵: {e}")
++        return None
++
++    @staticmethod
++    def _parse_active_identity(umo: str) -> tuple[bool, str]:
++        """从 UMO 解析 (是否群聊, 对方 user_id)。私聊返回真实 user_id；群聊返回 (True, "")。"""
++        text = str(umo or "")
++        if not text:
++            return True, ""
++        lowered = text.lower()
++        if any(k in lowered for k in ("group", "guild", "channel", "room")):
++            return True, ""
++        parts = text.split(":", 2)
++        real_id = parts[2].strip() if len(parts) == 3 else text.strip()
++        return False, real_id
++
++    def _build_active_persona_anchors(self, umo: str) -> str:
++        """为主动消息聚合四层角色状态：时间 + 日程 + 生理周期 + 好感关系。
++
++        proactive_chat 走 llm_generate 绕过 on_llm_request，需手动取各插件对外 anchor 拼接。
++        受 config.inject_persona_state 开关控制（默认开）；任一插件缺失/报错均降级为空。
++        私聊才注入好感与私密门控；群聊只注入时间/日程/身体状态（不暴露对单人好感、不群发撒娇）。
++        """
++        try:
++            if not self._parse_bool_setting(
++                self.config.get("inject_persona_state", True), True
++            ):
++                return ""
++        except Exception:
++            pass
++
++        is_group, user_id = self._parse_active_identity(umo)
++        favour = relationship = None
++        if not is_group and user_id:
++            fav = self._find_state_plugin("favorpro")
++            if fav is not None:
++                try:
++                    state = fav.manager.get_user_state(
++                        fav.manager.normalize_identifier(user_id), None,
++                        fav._identity_fallback_keys(user_id),
++                    )
++                    favour = state.get("favour")
++                    relationship = state.get("relationship")
++                except Exception as e:
++                    logger.debug(f"[主动消息] 读取 favorpro 状态失败喵: {e}")
++
++        segments: list[str] = []
++
++        time_plugin = self._find_state_plugin("time_prompt")
++        if time_plugin is not None and hasattr(time_plugin, "build_external_time_anchor"):
++            try:
++                segments.append(str(
++                    time_plugin.build_external_time_anchor(umo, purpose="active_share") or ""
++                ).strip())
++            except Exception as e:
++                logger.debug(f"[主动消息] 取时间锚失败喵: {e}")
++
++        life_plugin = self._find_state_plugin("life_scheduler")
++        if life_plugin is not None and hasattr(life_plugin, "build_external_life_anchor"):
++            try:
++                segments.append(str(life_plugin.build_external_life_anchor() or "").strip())
++            except Exception as e:
++                logger.debug(f"[主动消息] 取日程锚失败喵: {e}")
++
++        cycle_plugin = self._find_state_plugin("bio_cycle")
++        if cycle_plugin is not None and hasattr(cycle_plugin, "build_external_cycle_anchor"):
++            try:
++                segments.append(str(cycle_plugin.build_external_cycle_anchor(
++                    umo, purpose="active_share", favour=favour, relationship=relationship,
++                ) or "").strip())
++            except Exception as e:
++                logger.debug(f"[主动消息] 取周期锚失败喵: {e}")
++
++        if not is_group and user_id:
++            fav_plugin = self._find_state_plugin("favorpro")
++            if fav_plugin is not None and hasattr(fav_plugin, "build_external_favour_anchor"):
++                try:
++                    segments.append(str(
++                        fav_plugin.build_external_favour_anchor(user_id) or ""
++                    ).strip())
++                except Exception as e:
++                    logger.debug(f"[主动消息] 取好感锚失败喵: {e}")
++
++        return "\n\n".join(s for s in segments if s)
++
+     async def _prepare_llm_request(self, session_id: str) -> dict | None:
+         """准备 LLM 请求所需的上下文、人格和最终 Prompt。"""
+         try:
+@@ -684,6 +784,16 @@ class LlmMixin:
+                     )
+                 )
+ 
++            # 主动消息绕过 on_llm_request，手动叠加时间/日程/生理周期/好感四层角色状态。
++            state_anchors = self._build_active_persona_anchors(effective_session_id)
++            if state_anchors:
++                if original_system_prompt:
++                    original_system_prompt = (
++                        f"{original_system_prompt.rstrip()}\n\n{state_anchors}"
++                    )
++                else:
++                    original_system_prompt = state_anchors
++
+             return {
+                 "conv_id": conv_id,
+                 "history": effective_history_messages,

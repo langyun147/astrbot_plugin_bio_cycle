@@ -1,0 +1,134 @@
+diff --git a/core/generator.py b/core/generator.py
+index d96ebcc..9f63e92 100644
+--- a/core/generator.py
++++ b/core/generator.py
+@@ -405,8 +405,46 @@ class SchedulerGenerator:
+                 f"- 字段 \"outfit\" 的第一行必须以 \"风格：{ctx.outfit_style}\" 开头。\n"
+             )
+ 
++        cycle_hint = self._get_cycle_hint()
++        if cycle_hint:
++            prompt += (
++                "\n\n## 🩸 今日身体节律（影响日程基调）\n"
++                f"- 今天的身体状态：{cycle_hint}\n"
++                "- 该身体状态优先级高于上方随机的今日主题与日程类型："
++                "若两者冲突（例如随机到运动/社交日但身体处于经期或经前不适），"
++                "应让日程整体向身体状态倾斜，安排得更贴合身体此刻的真实需要。\n"
++                "- 但若存在用户补充要求，用户补充要求的优先级最高。\n"
++            )
++
+         return prompt
+ 
++    def _get_cycle_hint(self) -> str:
++        """读取 bio_cycle 插件的当日身体节律，用于让日程随生理周期起伏。
++
++        通过 get_all_stars 发现 bio_cycle 实例并调用其同步公共方法
++        get_cycle_context()；插件未装/未启用/未设定起点时返回空串，优雅降级。
++        """
++        try:
++            for plugin in self.context.get_all_stars():
++                p_id = str(getattr(plugin, "id", "") or "")
++                p_name = str(getattr(plugin, "name", "") or "")
++                if "bio_cycle" not in p_id and "bio_cycle" not in p_name:
++                    continue
++                inst = (
++                    getattr(plugin, "instance", None)
++                    or getattr(plugin, "star_instance", None)
++                    or getattr(plugin, "star_cls", None)
++                )
++                if inst is None or not hasattr(inst, "get_cycle_context"):
++                    return ""
++                ctx = inst.get_cycle_context()
++                if isinstance(ctx, dict) and ctx.get("enabled"):
++                    return str(ctx.get("schedule_hint", "") or "").strip()
++                return ""
++        except Exception as e:
++            logger.debug(f"[life_scheduler] 读取 bio_cycle 周期上下文失败: {e}")
++        return ""
++
+     async def _call_llm(self, prompt: str, *, sid: str = "life_scheduler_gen") -> str:
+         provider = self._get_schedule_provider()
+         if not provider:
+diff --git a/main.py b/main.py
+index d0b5d11..5a655a1 100644
+--- a/main.py
++++ b/main.py
+@@ -365,6 +365,25 @@ class LifeSchedulerPlugin(Star):
+                 return hint
+         return "符合当前日程的真实日常场景"
+ 
++    def _compose_life_inject_text(self, now: datetime.datetime, data) -> str:
++        """构造日程/穿搭的物理状态注入文本（hook 与对外 anchor 共用，单一来源）。"""
++        current_activity = self._infer_current_activity(data.schedule, now)
++        current_time = now.strftime("%Y-%m-%d %H:%M")
++        schedule_relation = self._schedule_relation_text(now, data.date)
++        return f"""
++[系统物理状态实时注入]
++真实当前时间：{current_time}
++当前时段：{time_desc(now.hour)}
++日程来源：{schedule_relation}
++参考穿搭：{data.outfit}
++参考全天日程表：{data.schedule}
++
++[当前绝对状态锚定]
++对比真实当前时间与参考日程，你当前正处于该项活动中：【{current_activity}】
++你必须严格基于“真实当前时间”与“当前绝对状态”对话；正在进行的活动表示“还没做完”，日程表上排在现在的活动后面的事情属于未来，不能提前说已经完成。
++如果日程来源日期与真实当前日期不同，只能把它当作跨日后的延续参考，真实日期必须以“真实当前时间”为准。
++[上述状态仅供需要时参考，无需主动提及]""".strip()
++
+     @filter.on_llm_request()
+     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+         """System Prompt 注入"""
+@@ -384,29 +403,33 @@ class LifeSchedulerPlugin(Star):
+         if data.status == "failed":
+             return
+ 
+-        current_activity = self._infer_current_activity(data.schedule, now)
+-        current_time = now.strftime("%Y-%m-%d %H:%M")
+-        schedule_relation = self._schedule_relation_text(now, data.date)
+-        inject_text = f"""
+-[系统物理状态实时注入]
+-真实当前时间：{current_time}
+-当前时段：{time_desc(now.hour)}
+-日程来源：{schedule_relation}
+-参考穿搭：{data.outfit}
+-参考全天日程表：{data.schedule}
+-
+-[当前绝对状态锚定]
+-对比真实当前时间与参考日程，你当前正处于该项活动中：【{current_activity}】
+-你必须严格基于“真实当前时间”与“当前绝对状态”对话；正在进行的活动表示“还没做完”，日程表上排在现在的活动后面的事情属于未来，不能提前说已经完成。
+-如果日程来源日期与真实当前日期不同，只能把它当作跨日后的延续参考，真实日期必须以“真实当前时间”为准。
+-[上述状态仅供需要时参考，无需主动提及]"""
+-
++        inject_text = self._compose_life_inject_text(now, data)
+         if getattr(req, "system_prompt", ""):
+-            req.system_prompt = f"{req.system_prompt.rstrip()}\n\n{inject_text.strip()}"
++            req.system_prompt = f"{req.system_prompt.rstrip()}\n\n{inject_text}"
+         else:
+-            req.system_prompt = inject_text.strip()
++            req.system_prompt = inject_text
+         logger.debug(f"[LLM] 添加的内在状态注入：{inject_text}")
+ 
++    def build_external_life_anchor(self, session_key: str | None = None) -> str:
++        """供绕过 on_llm_request 的主动推送链路复用的日程/穿搭状态锚。
++
++        与 on_llm_request 注入同源（同一 _compose_life_inject_text）。
++        只读当前已生效日程，不在此触发生成（主动链路不应阻塞等待 LLM 生成日程）；
++        未到生成时间、无日程或生成失败时返回空串，优雅降级。
++
++        Args:
++            session_key: 兼容其他 anchor 的统一签名，此处不需要，保留以便调用方一致调用。
++        """
++        try:
++            now = self._now()
++            data = self._get_effective_schedule_data(now)
++            if not data or data.status == "failed":
++                return ""
++            return self._compose_life_inject_text(now, data)
++        except Exception as e:
++            logger.debug(f"[life_scheduler] 构建外部日程锚失败: {e}")
++            return ""
++
+     @filter.command("查看日程", alias={"life show"})
+     async def life_show(self, event: AstrMessageEvent):
+         """查看今日的日程"""

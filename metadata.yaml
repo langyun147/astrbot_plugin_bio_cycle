@@ -1,0 +1,13 @@
+name: astrbot_plugin_bio_cycle
+display_name: 生理周期拟真
+desc: "为电子伴侣注入真实的生理周期：根据经期开始日推算当前所处的生理阶段（经期/卵泡期/排卵期/黄体期/经前期），自然影响其身体状态、情绪起伏与说话语气，并深度联动 life_scheduler 日程与 favorpro 好感度系统，让角色拥有连续、可信的身体节律。"
+help: |
+  管理员命令：
+  /周期            查看当前所处的生理阶段
+  /周期 设定 2026-05-20  设定最近一次经期开始日（支持「今天」）
+  /周期 长度 28     设定平均周期天数
+  /周期 经期 5      设定经期持续天数
+  /周期 开启 | /周期 关闭
+version: v1.0.0
+author: langyun147
+repo: "https://github.com/langyun147/astrbot_plugin_bio_cycle"

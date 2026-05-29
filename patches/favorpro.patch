@@ -1,0 +1,58 @@
+diff --git a/main.py b/main.py
+index 20950b4..c572019 100644
+--- a/main.py
++++ b/main.py
+@@ -358,6 +358,53 @@ class FavourProPlugin(Star):
+         )
+         self._append_to_system_prompt(req, f"{context_prompt}\n{instruction_prompt}")
+ 
++    def build_external_favour_anchor(
++        self,
++        user_id: str,
++        session_id: Optional[str] = None,
++    ) -> str:
++        """供绕过 on_llm_request 的主动推送链路复用的好感关系状态锚。
++
++        ⚠️ 安全约束：此方法【只输出只读状态上下文】，绝不输出 add_context_prompt 里那段
++        “机密指令/状态块格式要求”。因为主动链路（llm_generate）不经过 on_decorating_result
++        状态块剥离钩子，若注入更新指令，模型会在主动消息末尾输出 [Favour:...] 并直接泄露给用户。
++
++        Args:
++            user_id: 目标用户 ID（原始或已 normalize 均可）。
++            session_id: 可选会话 ID（session_based 模式下传入）。
++
++        Returns:
++            可叠加进 system_prompt 的只读状态段；默认状态（陌生人）或异常时返回空串。
++        """
++        try:
++            raw_user_id = "" if user_id is None else str(user_id).strip()
++            if not raw_user_id:
++                return ""
++            normalized_user_id = self.manager.normalize_identifier(raw_user_id)
++            normalized_session_id = self.manager.normalize_identifier(session_id) if session_id else None
++            fallback_keys = self._identity_fallback_keys(raw_user_id, session_id)
++            state = self.manager.get_user_state(
++                normalized_user_id, normalized_session_id, fallback_keys
++            )
++
++            # 默认/陌生状态不注入，避免给陌生对象拼“关系：陌生人，好感0”这种废话
++            default = self.manager.DEFAULT_STATE
++            if (
++                state.get("favour", default["favour"]) == default["favour"]
++                and state.get("attitude", default["attitude"]) == default["attitude"]
++                and state.get("relationship", default["relationship"]) == default["relationship"]
++            ):
++                return ""
++
++            return (
++                f"[当前关系状态] 你与对方的关系是：{state['relationship']}，"
++                f"好感度为 {state['favour']}，你对他的印象是：{state['attitude']}。"
++                f"请让这条主动消息的亲疏、语气与该关系状态保持一致。"
++            )
++        except Exception as e:
++            logger.debug("[favorpro] 构建外部好感锚失败: %s", e)
++            return ""
++
+     def _parse_state_block(self, block_text: str) -> Dict[str, Any]:
+         """解析状态块，兼容中文标点和字段顺序轻微变化。"""
+         parsed: Dict[str, Any] = {}
